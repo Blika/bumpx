@@ -9,3 +9,5 @@ Also can do the opposite - take bump + bump# textures from Stalker/Metro 2033 bu
 No longer throws an error if bumps are of different size.
 
 Output height and gloss maps as PNG instead of TGA. For some reason Unreal 5 didn't like those TGA formats yet normal maps functioned as expected. Dirty fix I guess but it works.
+
+DXT1, DXT3, DXT5, BC4, BC5 are supported.
