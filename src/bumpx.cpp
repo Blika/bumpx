@@ -900,36 +900,36 @@ int UnpackBump(int argc, Char** argv) {
         return -1;
     }
 
-    if (bump.width != bumpX.width || bump.height != bumpX.height) {
+    /*if (bump.width != bumpX.width || bump.height != bumpX.height) {
         Cout << _T("The two dds files are not of the same size! Aborting...") << std::endl;
         return -1;
-    }
+    }*/
 
     fs::path bumpName = bumpPath.stem();
 
     fs::path outputFolder = (argc == 3) ? argv[2] : bumpPath.parent_path();
 
     Cout << _T("Saving out heightmap:") << std::endl;
-    fs::path heightmapPath = outputFolder / (bumpName.native() + _T("_height.tga"));
+    fs::path heightmapPath = outputFolder / (bumpName.native() + _T("_height.png"));
     Cout << heightmapPath << std::endl;
     std::vector<uint8_t> heightmapData(bumpX.width * bumpX.height);
     for (size_t i = 0; i < bumpX.width * bumpX.height; ++i) {
         heightmapData[i] = bumpX.pixels[i].a;
     }
-    int stbResult = stbi_write_tga(heightmapPath.u8string().c_str(), scast<int>(bumpX.width), scast<int>(bumpX.height), 1, heightmapData.data());
+    int stbResult = stbi_write_png(heightmapPath.u8string().c_str(), scast<int>(bumpX.width), scast<int>(bumpX.height), 1, heightmapData.data(), 1 * scast<int>(bump.width));
     if (!stbResult) {
         Cout << _T("Failed :(") << std::endl;
     }
     heightmapData.clear();
 
     Cout << _T("Saving out glossmap:") << std::endl;
-    fs::path glossmapPath = outputFolder / (bumpName.native() + _T("_gloss.tga"));
+    fs::path glossmapPath = outputFolder / (bumpName.native() + _T("_gloss.png"));
     Cout << glossmapPath << std::endl;
     std::vector<uint8_t> glossmapData(bump.width * bump.height);
     for (size_t i = 0; i < bump.width * bump.height; ++i) {
         glossmapData[i] = bump.pixels[i].r;
     }
-    stbResult = stbi_write_tga(glossmapPath.u8string().c_str(), scast<int>(bump.width), scast<int>(bump.height), 1, glossmapData.data());
+    stbResult = stbi_write_png(glossmapPath.u8string().c_str(), scast<int>(bump.width), scast<int>(bump.height), 1, glossmapData.data(), 1 * scast<int>(bump.width));
     if (!stbResult) {
         Cout << _T("Failed :(") << std::endl;
     }
