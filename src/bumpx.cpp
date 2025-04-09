@@ -107,6 +107,21 @@ constexpr size_t kNumCompressors = 4;
 constexpr size_t kNumCompressors = 3;
 #endif
 
+const uint32_t DDPF_FOURCC = 0x00000004;
+
+#define MAKEFOURCC(ch0, ch1, ch2, ch3) \
+    ((uint32_t)(uint8_t)(ch0) | \
+     ((uint32_t)(uint8_t)(ch1) << 8) | \
+     ((uint32_t)(uint8_t)(ch2) << 16) | \
+     ((uint32_t)(uint8_t)(ch3) << 24))
+
+#define FOURCC_DXT1 MAKEFOURCC('D','X','T','1')
+#define FOURCC_DXT3 MAKEFOURCC('D','X','T','3')
+#define FOURCC_DXT5 MAKEFOURCC('D','X','T','5')
+#define FOURCC_BC4U MAKEFOURCC('B','C','4','U')
+#define FOURCC_BC5U MAKEFOURCC('B','C','5','U')
+#define FOURCC_DX10 MAKEFOURCC('D','X','1','0')
+
 static const String kCompressorsNames[kNumCompressors] = {
     _T("STB (nothings.org)"),
     _T("Squish"),
@@ -855,34 +870,237 @@ int PackBump(int argc, Char** argv) {
     return 0;
 }
 
-int UnpackBump(int argc, Char** argv) {
-    auto loadAndDecompressDDS = [](const fs::path& ddsPath)->Bitmap<PixelRgba> {
-        std::ifstream file(ddsPath, std::ifstream::in | std::ifstream::binary);
-        if (file.is_open()) {
-            uint32_t signature = 0;
-            file.read(rcast<char*>(&signature), sizeof(signature));
-            if (kDDSFileSignature == signature) {
-                DDSURFACEDESC2 desc = {};
-                file.read(rcast<char*>(&desc), sizeof(desc));
-                if (desc.ddpfPixelFormat.dwFlags == 0x00000004 &&   // DDPF_FOURCC
-                    desc.ddpfPixelFormat.dwFourCC == 0x35545844) {  // DXT5
-                    const size_t compressedSize = ((desc.dwWidth / 4) * (desc.dwHeight / 4)) * 16;
-                    std::vector<uint8_t> compressedImage(compressedSize);
-                    file.read(rcast<char*>(compressedImage.data()), compressedImage.size());
-                    file.close();
+void DecompressBC1(const uint8_t* blockData, Bitmap<PixelRgba>& bmp){
+    uint16_t color0 = *reinterpret_cast<const uint16_t*>(blockData);
+    uint16_t color1 = *reinterpret_cast<const uint16_t*>(blockData + 2);
+    uint32_t indices = *reinterpret_cast<const uint32_t*>(blockData + 4);
 
-                    Bitmap<PixelRgba> bmp(desc.dwWidth, desc.dwHeight);
-                    DecompressBC3_MY(compressedImage.data(), bmp);
-                    return bmp;
-                } else {
-                    return Bitmap<PixelRgba>(0, 0);
-                }
-            } else {
-                return Bitmap<PixelRgba>(0, 0);
+    auto unpackColor = [](uint16_t color) -> PixelRgba {
+        return PixelRgba{
+            static_cast<uint8_t>(((color >> 11) & 0x1F) * 255 / 31),  // R
+            static_cast<uint8_t>(((color >> 5) & 0x3F) * 255 / 63),    // G
+            static_cast<uint8_t>((color & 0x1F) * 255 / 31),          // B
+            255                                                       // A
+        };
+    };
+
+    PixelRgba colors[4];
+    colors[0] = unpackColor(color0);
+    colors[1] = unpackColor(color1);
+    
+    if (color0 > color1){
+        colors[2] = PixelRgba{
+            static_cast<uint8_t>((2 * colors[0].r + colors[1].r) / 3),
+            static_cast<uint8_t>((2 * colors[0].g + colors[1].g) / 3),
+            static_cast<uint8_t>((2 * colors[0].b + colors[1].b) / 3),
+            255
+        };
+        colors[3] = PixelRgba{
+            static_cast<uint8_t>((colors[0].r + 2 * colors[1].r) / 3),
+            static_cast<uint8_t>((colors[0].g + 2 * colors[1].g) / 3),
+            static_cast<uint8_t>((colors[0].b + 2 * colors[1].b) / 3),
+            255
+        };
+    }else{
+        colors[2] = PixelRgba{
+            static_cast<uint8_t>((colors[0].r + colors[1].r) / 2),
+            static_cast<uint8_t>((colors[0].g + colors[1].g) / 2),
+            static_cast<uint8_t>((colors[0].b + colors[1].b) / 2),
+            255
+        };
+        colors[3] = PixelRgba{0, 0, 0, 0};  // Transparent black
+    }
+
+    // Decompress each 4x4 block
+    for(int blockY = 0; blockY < 4; blockY++){
+        for(int blockX = 0; blockX < 4; blockX++){
+            int idx = (indices >> (2 * (4 * blockY + blockX))) & 0x03;
+            if(blockX < bmp.width && blockY < bmp.height){
+                bmp.pixels[blockY * bmp.width + blockX] = colors[idx];
             }
-        } else {
+        }
+    }
+}
+
+void DecompressBC2(const uint8_t* blockData, Bitmap<PixelRgba>& bmp){
+    const uint64_t alphaBits = *reinterpret_cast<const uint64_t*>(blockData);
+    DecompressBC1(blockData + 8, bmp);
+    for(int blockY = 0; blockY < 4; blockY++){
+        for(int blockX = 0; blockX < 4; blockX++){
+            if(blockX < bmp.width && blockY < bmp.height){
+                int shift = 4 * (4 * blockY + blockX);
+                uint8_t alpha = static_cast<uint8_t>((alphaBits >> shift) & 0x0F);
+                alpha = (alpha << 4) | alpha;
+                
+                size_t pixelIndex = blockY * bmp.width + blockX;
+                bmp.pixels[pixelIndex].a = alpha;
+            }
+        }
+    }
+}
+
+void DecompressBC3(const uint8_t* blockData, Bitmap<PixelRgba>& bmp){
+    uint8_t alpha0 = blockData[0];
+    uint8_t alpha1 = blockData[1];
+    const uint64_t alphaBits = *reinterpret_cast<const uint64_t*>(blockData) >> 16;
+
+    uint8_t alphaTable[8];
+    alphaTable[0] = alpha0;
+    alphaTable[1] = alpha1;
+    
+    if(alpha0 > alpha1){
+        alphaTable[2] = static_cast<uint8_t>((6 * alpha0 + 1 * alpha1) / 7);
+        alphaTable[3] = static_cast<uint8_t>((5 * alpha0 + 2 * alpha1) / 7);
+        alphaTable[4] = static_cast<uint8_t>((4 * alpha0 + 3 * alpha1) / 7);
+        alphaTable[5] = static_cast<uint8_t>((3 * alpha0 + 4 * alpha1) / 7);
+        alphaTable[6] = static_cast<uint8_t>((2 * alpha0 + 5 * alpha1) / 7);
+        alphaTable[7] = static_cast<uint8_t>((1 * alpha0 + 6 * alpha1) / 7);
+    }else{
+        alphaTable[2] = static_cast<uint8_t>((4 * alpha0 + 1 * alpha1) / 5);
+        alphaTable[3] = static_cast<uint8_t>((3 * alpha0 + 2 * alpha1) / 5);
+        alphaTable[4] = static_cast<uint8_t>((2 * alpha0 + 3 * alpha1) / 5);
+        alphaTable[5] = static_cast<uint8_t>((1 * alpha0 + 4 * alpha1) / 5);
+        alphaTable[6] = 0;
+        alphaTable[7] = 255;
+    }
+
+    DecompressBC1(blockData + 8, bmp);
+
+    for(int blockY = 0; blockY < 4; blockY++){
+        for(int blockX = 0; blockX < 4; blockX++){
+            if(blockX < bmp.width && blockY < bmp.height){
+                int shift = 3 * (4 * blockY + blockX);
+                uint8_t alphaIdx = static_cast<uint8_t>((alphaBits >> shift) & 0x07);
+                
+                size_t pixelIndex = blockY * bmp.width + blockX;
+                bmp.pixels[pixelIndex].a = alphaTable[alphaIdx];
+            }
+        }
+    }
+}
+
+void DecompressBC4(const uint8_t* blockData, Bitmap<PixelRgba>& bmp, uint32_t channel = 0){
+    uint8_t alpha0 = blockData[0];
+    uint8_t alpha1 = blockData[1];
+    const uint64_t alphaBits = *reinterpret_cast<const uint64_t*>(blockData) >> 16;
+
+    uint8_t alphaTable[8];
+    alphaTable[0] = alpha0;
+    alphaTable[1] = alpha1;
+
+    if (alpha0 > alpha1){
+        alphaTable[2] = static_cast<uint8_t>((6 * alpha0 + 1 * alpha1) / 7);
+        alphaTable[3] = static_cast<uint8_t>((5 * alpha0 + 2 * alpha1) / 7);
+        alphaTable[4] = static_cast<uint8_t>((4 * alpha0 + 3 * alpha1) / 7);
+        alphaTable[5] = static_cast<uint8_t>((3 * alpha0 + 4 * alpha1) / 7);
+        alphaTable[6] = static_cast<uint8_t>((2 * alpha0 + 5 * alpha1) / 7);
+        alphaTable[7] = static_cast<uint8_t>((1 * alpha0 + 6 * alpha1) / 7);
+    }else{
+        alphaTable[2] = static_cast<uint8_t>((4 * alpha0 + 1 * alpha1) / 5);
+        alphaTable[3] = static_cast<uint8_t>((3 * alpha0 + 2 * alpha1) / 5);
+        alphaTable[4] = static_cast<uint8_t>((2 * alpha0 + 3 * alpha1) / 5);
+        alphaTable[5] = static_cast<uint8_t>((1 * alpha0 + 4 * alpha1) / 5);
+        alphaTable[6] = 0;
+        alphaTable[7] = 255;
+    }
+
+    for(int blockY = 0; blockY < 4; blockY++){
+        for(int blockX = 0; blockX < 4; blockX++){
+            if(blockX < bmp.width && blockY < bmp.height){
+                int shift = 3 * (4 * blockY + blockX);
+                uint8_t alphaIdx = static_cast<uint8_t>((alphaBits >> shift) & 0x07);
+                uint8_t value = alphaTable[alphaIdx];
+
+                size_t pixelIndex = blockY * bmp.width + blockX;
+                switch(channel){
+                    case 0: bmp.pixels[pixelIndex].r = value; break;
+                    case 1: bmp.pixels[pixelIndex].g = value; break;
+                    case 2: bmp.pixels[pixelIndex].b = value; break;
+                    case 3: bmp.pixels[pixelIndex].a = value; break;
+                }
+            }
+        }
+    }
+}
+
+void DecompressBC5(const uint8_t* blockData, Bitmap<PixelRgba>& bmp){
+    DecompressBC4(blockData, bmp, 0);
+    DecompressBC4(blockData + 8, bmp, 1);
+    
+    for(size_t i = 0; i < bmp.pixels.size(); i++){
+        bmp.pixels[i].b = 0;
+        bmp.pixels[i].a = 255;
+    }
+}
+
+int UnpackBump(int argc, Char** argv) {
+    auto loadAndDecompressDDS = [](const fs::path& ddsPath)->Bitmap<PixelRgba>{
+        std::ifstream file(ddsPath, std::ifstream::in | std::ifstream::binary);
+        if(!file.is_open()){
             return Bitmap<PixelRgba>(0, 0);
         }
+        uint32_t signature = 0;
+        file.read(reinterpret_cast<char*>(&signature), sizeof(signature));
+        if(signature != 0x20534444){
+            return Bitmap<PixelRgba>(0, 0);
+        }
+
+        DDSURFACEDESC2 desc = {};
+        file.read(reinterpret_cast<char*>(&desc), sizeof(desc));
+        if(!(desc.ddpfPixelFormat.dwFlags & DDPF_FOURCC)){
+            return Bitmap<PixelRgba>(0, 0);
+        }
+        uint32_t widthBlocks = (desc.dwWidth + 3) / 4;
+        uint32_t heightBlocks = (desc.dwHeight + 3) / 4;
+        size_t blockSize = 16;
+        uint32_t format = desc.ddpfPixelFormat.dwFourCC;
+        switch(format){
+            case FOURCC_DXT1:
+                blockSize = 8;
+                break;
+            case FOURCC_DXT3:
+            case FOURCC_DXT5:
+            case FOURCC_BC4U:
+            case FOURCC_BC5U:
+                blockSize = 16;
+                break;
+            case FOURCC_DX10:
+                return Bitmap<PixelRgba>(0, 0);
+            default:
+                return Bitmap<PixelRgba>(0, 0);
+        }
+
+        size_t compressedSize = widthBlocks * heightBlocks * blockSize;
+        std::vector<uint8_t> compressedImage(compressedSize);
+        file.read(reinterpret_cast<char*>(compressedImage.data()), compressedSize);
+        file.close();
+
+        Bitmap<PixelRgba> bmp(desc.dwWidth, desc.dwHeight);
+        bmp.pixels.assign(bmp.pixels.size(), PixelRgba{0,0,0,255});
+
+        for(uint32_t blockY = 0; blockY < heightBlocks; blockY++){
+            for(uint32_t blockX = 0; blockX < widthBlocks; blockX++){
+                const uint8_t* blockPtr = compressedImage.data() + (blockY * widthBlocks + blockX) * blockSize;
+                Bitmap<PixelRgba> blockBmp(4, 4);
+                switch(format){
+                    case FOURCC_DXT1: DecompressBC1(blockPtr, blockBmp); break;
+                    case FOURCC_DXT3: DecompressBC2(blockPtr, blockBmp); break;
+                    case FOURCC_DXT5: DecompressBC3(blockPtr, blockBmp); break;
+                    case FOURCC_BC4U: DecompressBC4(blockPtr, blockBmp, 0); break;
+                    case FOURCC_BC5U: DecompressBC5(blockPtr, blockBmp); break;
+                }
+                for(uint32_t y = 0; y < 4; y++){
+                    for(uint32_t x = 0; x < 4; x++){
+                        uint32_t imgX = blockX * 4 + x;
+                        uint32_t imgY = blockY * 4 + y;
+                        if(imgX < bmp.width && imgY < bmp.height){
+                            bmp.pixels[imgY * bmp.width + imgX] = blockBmp.pixels[y * 4 + x];
+                        }
+                    }
+                }
+            }
+        }
+        return bmp;
     };
 
     fs::path bumpPath = argv[1];
