@@ -107,7 +107,6 @@ constexpr size_t kNumCompressors = 4;
 constexpr size_t kNumCompressors = 3;
 #endif
 
-const uint32_t DDPF_FOURCC = 0x00000004;
 
 #define MAKEFOURCC(ch0, ch1, ch2, ch3) \
     ((uint32_t)(uint8_t)(ch0) | \
@@ -121,6 +120,10 @@ const uint32_t DDPF_FOURCC = 0x00000004;
 #define FOURCC_BC4U MAKEFOURCC('B','C','4','U')
 #define FOURCC_BC5U MAKEFOURCC('B','C','5','U')
 #define FOURCC_DX10 MAKEFOURCC('D','X','1','0')
+#define FOURCC_ATI1 MAKEFOURCC('A','T','I','1')
+#define FOURCC_ATI2 MAKEFOURCC('A','T','I','2')
+#define FOURCC_BC6H MAKEFOURCC('B','C','6','H')
+#define FOURCC_BC7  MAKEFOURCC('B','C','7',' ')
 
 static const String kCompressorsNames[kNumCompressors] = {
     _T("STB (nothings.org)"),
@@ -129,6 +132,28 @@ static const String kCompressorsNames[kNumCompressors] = {
 #ifdef ENABLE_NVTT3
     _T("Nvidia Texture Tools 3")
 #endif
+};
+
+enum DXGI_FORMAT{
+    DXGI_FORMAT_UNKNOWN = 0,
+    DXGI_FORMAT_R8G8B8A8_UNORM = 28,
+    DXGI_FORMAT_BC6H_UF16 = 95,
+    DXGI_FORMAT_BC7_UNORM = 98
+};
+
+const uint32_t DDPF_ALPHAPIXELS = 0x1;
+const uint32_t DDPF_ALPHA = 0x2;
+const uint32_t DDPF_FOURCC = 0x4;
+const uint32_t DDPF_RGB = 0x40;
+const uint32_t DDPF_YUV = 0x200;
+const uint32_t DDPF_LUMINANCE = 0x20000;
+
+struct DDS_HEADER_DXT10{
+    uint32_t dxgiFormat;
+    uint32_t resourceDimension;
+    uint32_t miscFlag;
+    uint32_t arraySize;
+    uint32_t miscFlags2;
 };
 
 static size_t Log2I(size_t v) {
@@ -1034,11 +1059,12 @@ void DecompressBC5(const uint8_t* blockData, Bitmap<PixelRgba>& bmp){
 }
 
 int UnpackBump(int argc, Char** argv) {
-    auto loadAndDecompressDDS = [](const fs::path& ddsPath)->Bitmap<PixelRgba>{
+    auto loadAndDecompressDDS = [](const fs::path& ddsPath)->Bitmap<PixelRgba> {
         std::ifstream file(ddsPath, std::ifstream::in | std::ifstream::binary);
         if(!file.is_open()){
             return Bitmap<PixelRgba>(0, 0);
         }
+
         uint32_t signature = 0;
         file.read(reinterpret_cast<char*>(&signature), sizeof(signature));
         if(signature != 0x20534444){
@@ -1047,59 +1073,101 @@ int UnpackBump(int argc, Char** argv) {
 
         DDSURFACEDESC2 desc = {};
         file.read(reinterpret_cast<char*>(&desc), sizeof(desc));
-        if(!(desc.ddpfPixelFormat.dwFlags & DDPF_FOURCC)){
+
+        if(desc.dwSize != sizeof(DDSURFACEDESC2)){
             return Bitmap<PixelRgba>(0, 0);
         }
-        uint32_t widthBlocks = (desc.dwWidth + 3) / 4;
-        uint32_t heightBlocks = (desc.dwHeight + 3) / 4;
-        size_t blockSize = 16;
-        uint32_t format = desc.ddpfPixelFormat.dwFourCC;
-        switch(format){
-            case FOURCC_DXT1:
-                blockSize = 8;
-                break;
-            case FOURCC_DXT3:
-            case FOURCC_DXT5:
-            case FOURCC_BC4U:
-            case FOURCC_BC5U:
-                blockSize = 16;
-                break;
-            case FOURCC_DX10:
-                return Bitmap<PixelRgba>(0, 0);
-            default:
-                return Bitmap<PixelRgba>(0, 0);
-        }
 
-        size_t compressedSize = widthBlocks * heightBlocks * blockSize;
-        std::vector<uint8_t> compressedImage(compressedSize);
-        file.read(reinterpret_cast<char*>(compressedImage.data()), compressedSize);
-        file.close();
+        const uint32_t width = desc.dwWidth;
+        const uint32_t height = desc.dwHeight;
+        Bitmap<PixelRgba> bmp(width, height);
 
-        Bitmap<PixelRgba> bmp(desc.dwWidth, desc.dwHeight);
-        bmp.pixels.assign(bmp.pixels.size(), PixelRgba{0,0,0,255});
+        if(desc.ddpfPixelFormat.dwFlags & DDPF_RGB){
+            const DDPIXELFORMAT& pf = desc.ddpfPixelFormat;
+            const uint32_t pixelSize = pf.dwRGBBitCount / 8;
+            const bool hasAlpha = (pf.dwFlags & DDPF_ALPHAPIXELS) && (pf.dwRGBAlphaBitMask != 0);
 
-        for(uint32_t blockY = 0; blockY < heightBlocks; blockY++){
-            for(uint32_t blockX = 0; blockX < widthBlocks; blockX++){
-                const uint8_t* blockPtr = compressedImage.data() + (blockY * widthBlocks + blockX) * blockSize;
-                Bitmap<PixelRgba> blockBmp(4, 4);
-                switch(format){
-                    case FOURCC_DXT1: DecompressBC1(blockPtr, blockBmp); break;
-                    case FOURCC_DXT3: DecompressBC2(blockPtr, blockBmp); break;
-                    case FOURCC_DXT5: DecompressBC3(blockPtr, blockBmp); break;
-                    case FOURCC_BC4U: DecompressBC4(blockPtr, blockBmp, 0); break;
-                    case FOURCC_BC5U: DecompressBC5(blockPtr, blockBmp); break;
+            std::vector<uint8_t> pixels(width * height * pixelSize);
+            file.read(reinterpret_cast<char*>(pixels.data()), pixels.size());
+
+            auto extractChannel = [](uint32_t value, uint32_t mask) -> uint8_t {
+                if(mask == 0) return 0;
+                unsigned long shift = 0;
+                #ifdef _WIN32
+                    _BitScanForward(&shift, mask);
+                #else
+                    shift = __builtin_ctz(mask);
+                #endif
+                uint32_t channel = (value & mask) >> shift;
+                if(mask > 0xFF){
+                    uint32_t maxVal = mask >> shift;
+                    channel = (channel * 255) / maxVal;
                 }
-                for(uint32_t y = 0; y < 4; y++){
-                    for(uint32_t x = 0; x < 4; x++){
-                        uint32_t imgX = blockX * 4 + x;
-                        uint32_t imgY = blockY * 4 + y;
-                        if(imgX < bmp.width && imgY < bmp.height){
-                            bmp.pixels[imgY * bmp.width + imgX] = blockBmp.pixels[y * 4 + x];
+                return static_cast<uint8_t>(channel);
+            };
+
+            for(uint32_t y = 0; y < height; y++){
+                for(uint32_t x = 0; x < width; x++){
+                    const uint8_t* pixel = &pixels[(y * width + x) * pixelSize];
+                    uint32_t pixelValue = 0;
+                    memcpy(&pixelValue, pixel, std::min(pixelSize, 4u));
+
+                    PixelRgba result;
+                    result.r = extractChannel(pixelValue, pf.dwRBitMask);
+                    result.g = extractChannel(pixelValue, pf.dwGBitMask);
+                    result.b = extractChannel(pixelValue, pf.dwBBitMask);
+                    result.a = hasAlpha ? extractChannel(pixelValue, pf.dwRGBAlphaBitMask) : 255;
+
+                    if(pf.dwBBitMask > pf.dwRBitMask){
+                        std::swap(result.r, result.b);
+                    }
+                    bmp.pixels[y * width + x] = result;
+                }
+            }
+        }else if(desc.ddpfPixelFormat.dwFlags & DDPF_FOURCC){
+            uint32_t format = desc.ddpfPixelFormat.dwFourCC;
+            uint32_t widthBlocks = (width + 3) / 4;
+            uint32_t heightBlocks = (height + 3) / 4;
+            size_t blockSize = 0;
+
+            switch(format){
+                case FOURCC_DXT1: blockSize = 8; break;
+                case FOURCC_DXT3: 
+                case FOURCC_DXT5: 
+                case FOURCC_BC4U: 
+                case FOURCC_BC5U: blockSize = 16; break;
+                default: return Bitmap<PixelRgba>(0, 0);
+            }
+
+            std::vector<uint8_t> compressedData(widthBlocks * heightBlocks * blockSize);
+            file.read(reinterpret_cast<char*>(compressedData.data()), compressedData.size());
+
+            for(uint32_t blockY = 0; blockY < heightBlocks; blockY++){
+                for(uint32_t blockX = 0; blockX < widthBlocks; blockX++){
+                    const uint8_t* blockPtr = compressedData.data() + (blockY * widthBlocks + blockX) * blockSize;
+                    Bitmap<PixelRgba> blockBmp(4, 4);
+
+                    switch(format){
+                        case FOURCC_DXT1: DecompressBC1(blockPtr, blockBmp); break;
+                        case FOURCC_DXT3: DecompressBC2(blockPtr, blockBmp); break;
+                        case FOURCC_DXT5: DecompressBC3(blockPtr, blockBmp); break;
+                        case FOURCC_BC4U: DecompressBC4(blockPtr, blockBmp, 0); break;
+                        case FOURCC_BC5U: DecompressBC5(blockPtr, blockBmp); break;
+                    }
+
+                    for(uint32_t y = 0; y < 4; y++){
+                        for(uint32_t x = 0; x < 4; x++){
+                            uint32_t imgX = blockX * 4 + x;
+                            uint32_t imgY = blockY * 4 + y;
+                            if(imgX < width && imgY < height){
+                                bmp.pixels[imgY * width + imgX] = blockBmp.pixels[y * 4 + x];
+                            }
                         }
                     }
                 }
             }
         }
+        file.close();
         return bmp;
     };
 
