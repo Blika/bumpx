@@ -1186,10 +1186,22 @@ int UnpackBump(int argc, Char** argv) {
         return -1;
     }
 
-    /*if (bump.width != bumpX.width || bump.height != bumpX.height) {
-        Cout << _T("The two dds files are not of the same size! Aborting...") << std::endl;
-        return -1;
-    }*/
+    if(bump.width != bumpX.width || bump.height != bumpX.height){
+        Bitmap<PixelRgba> resizedBumpX(bump.width, bump.height);
+        stbir_resize_uint8(
+            reinterpret_cast<const unsigned char*>(bumpX.pixels.data()),
+            bumpX.width,
+            bumpX.height,
+            0,
+            reinterpret_cast<unsigned char*>(resizedBumpX.pixels.data()),
+            bump.width,
+            bump.height,
+            0,
+            4
+        );
+        bumpX = std::move(resizedBumpX);
+        Cout << _T("Resizing bump#") << std::endl;
+    }
 
     fs::path bumpName = bumpPath.stem();
 
@@ -1202,7 +1214,7 @@ int UnpackBump(int argc, Char** argv) {
     for (size_t i = 0; i < bumpX.width * bumpX.height; ++i) {
         heightmapData[i] = bumpX.pixels[i].a;
     }
-    int stbResult = stbi_write_png(heightmapPath.u8string().c_str(), scast<int>(bumpX.width), scast<int>(bumpX.height), 1, heightmapData.data(), 1 * scast<int>(bump.width));
+    int stbResult = stbi_write_png(heightmapPath.u8string().c_str(), scast<int>(bumpX.width), scast<int>(bumpX.height), 1, heightmapData.data(), 1 * scast<int>(bumpX.width));
     if (!stbResult) {
         Cout << _T("Failed :(") << std::endl;
     }
